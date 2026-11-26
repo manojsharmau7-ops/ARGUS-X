@@ -203,6 +203,63 @@ main {
   color: #8192a5;
 }
 
+.mode-switch {
+  display: flex;
+  gap: 12px;
+  margin: 0 0 14px;
+  color: #aab8c8;
+  font-size: 11px;
+}
+
+.mode-switch label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mode-switch input {
+  accent-color: #5eead4;
+}
+
+.camera-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.camera-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 90px;
+  gap: 10px;
+  align-items: center;
+  color: #aab8c8;
+  font-size: 11px;
+}
+
+.camera-file-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.camera-file-row input {
+  width: 100%;
+  border: 1px solid #314253;
+  border-radius: 6px;
+  padding: 7px;
+  background: #0b121a;
+  color: #e9edf4;
+}
+
+#in-direction {
+  width: 100%;
+  border: 1px solid #314253;
+  border-radius: 6px;
+  padding: 8px;
+  background: #0b121a;
+  color: #e9edf4;
+}
+
 .settings {
   margin: 24px 0 18px;
 }
@@ -390,6 +447,81 @@ input[type='range'] {
   display: block;
 }
 
+.camera-result + .camera-result {
+  margin-top: 18px;
+}
+
+.flow-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: baseline;
+  margin-top: 9px;
+  padding: 10px 12px;
+  border: 1px solid #263a49;
+  border-radius: 8px;
+  background: #0d1822;
+  font-size: 11px;
+}
+
+.flow-counts > span {
+  color: #5eead4;
+  font: 12px 'DM Mono';
+}
+
+.flow-counts small {
+  color: #a8b8c8;
+}
+
+.movement-alerts {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+  padding: 10px 12px;
+  border: 1px solid #263a49;
+  border-radius: 8px;
+  background: #0d1822;
+  font-size: 11px;
+}
+
+.movement-alert {
+  display: grid;
+  gap: 3px;
+  color: #a8b8c8;
+}
+
+.movement-alert small,
+.movement-alerts > small {
+  color: #8497aa;
+}
+
+.count-summary,
+.cross-camera-summary {
+  display: grid;
+  gap: 9px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid #263a49;
+  border-radius: 9px;
+  background: #0d1822;
+  font-size: 11px;
+}
+
+.count-summary > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.count-summary span,
+.cross-camera-summary span {
+  color: #a8b8c8;
+}
+
+.cross-camera-summary span {
+  display: block;
+}
+
 .identity-title {
   display: flex;
   justify-content: space-between;
@@ -409,6 +541,7 @@ input[type='range'] {
 
 .identity-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 11px;
   padding: 10px 0;
@@ -453,6 +586,26 @@ input[type='range'] {
   display: block;
   font: 9px 'DM Sans';
   color: #8090a2;
+}
+
+.movement-details {
+  flex-basis: 100%;
+  padding-left: 46px;
+  color: #90a2b5;
+  font-size: 10px;
+}
+
+.movement-details summary {
+  cursor: pointer;
+  color: #5eead4;
+}
+
+.movement-details ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 8px 0 2px;
+  padding-left: 16px;
 }
 
 .no-identities {

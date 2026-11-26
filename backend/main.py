@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import os
 import shutil
 import threading
@@ -9,7 +10,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from analytics import TrackingAnalytics
 from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -22,8 +24,8 @@ UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
 INFERENCE_SIZE = 960
-TILE_START_THRESHOLD = 800
-TILE_SCALE = 0.70
+TILE_SIZE = 1280
+TILE_OVERLAP = 0.20
 MODEL_NAME = os.getenv("YOLO_MODEL", "yolov8s.pt")
 INFERENCE_BATCH_SIZE = 4
 
@@ -67,6 +69,9 @@ class Detection(TypedDict):
 
 class VisibleObject(TypedDict):
     id: int
+    global_id: int
+    camera_id: str
+    cross_camera_similarity: float | None
     box: list[float]
     class_name: str
     confidence: float
@@ -101,18 +106,30 @@ def pairwise_iou(boxes_a: FloatArray, boxes_b: FloatArray) -> FloatArray:
 
 
 def _axis_regions(length: int) -> list[tuple[int, int]]:
-    if length <= TILE_START_THRESHOLD:
+    if length <= TILE_SIZE:
         return [(0, length)]
-    tile_length = max(480, int(length * TILE_SCALE))
-    return [(0, tile_length), (length - tile_length, length)]
+
+    tile_count = math.ceil(
+        (length - TILE_SIZE * TILE_OVERLAP)
+        / (TILE_SIZE * (1 - TILE_OVERLAP))
+    )
+    tile_length = length / (tile_count - (tile_count - 1) * TILE_OVERLAP)
+    stride = tile_length * (1 - TILE_OVERLAP)
+    regions: list[tuple[int, int]] = []
+
+    for index in range(tile_count):
+        start = round(index * stride)
+        end = length if index == tile_count - 1 else round(start + tile_length)
+        regions.append((start, end))
+
+    return regions
 
 
 def detect_objects(frame: ImageArray, confidence: float) -> list[Detection]:
     height, width = frame.shape[:2]
 
-    # Use one full-frame pass for smaller videos.
-    # For larger videos, divide the image into overlapping tiles.
-    if max(width, height) > TILE_START_THRESHOLD:
+    # Keep large frames near the model's inference scale to retain small-object detail.
+    if max(width, height) > TILE_SIZE:
         x_regions = _axis_regions(width)
         y_regions = _axis_regions(height)
 
@@ -322,6 +339,9 @@ class IdentityTracker:
         return [
             {
                 "id": track.id,
+                "global_id": track.id,
+                "camera_id": "",
+                "cross_camera_similarity": None,
                 "box": [round(float(value), 1) for value in track.box],
                 "class_name": track.class_name,
                 "confidence": round(float(track.confidence), 3),
@@ -331,13 +351,213 @@ class IdentityTracker:
             if track.last_seen == frame_no
         ]
 
+def validate_camera_id(camera_id: str) -> str:
+    normalized = camera_id.strip()
+    if (
+        not normalized
+        or len(normalized) > 64
+        or not normalized.isascii()
+        or not all(char.isalnum() or char in "._-" for char in normalized)
+    ):
+        raise HTTPException(
+            400,
+            "Camera IDs must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens.",
+        )
+    return normalized
+
+
+def validate_tracking_settings(confidence: float, max_age: int) -> None:
+    if not 0.05 <= confidence <= 0.95:
+        raise HTTPException(400, "Confidence must be between 0.05 and 0.95.")
+    if not 1 <= max_age <= 1000:
+        raise HTTPException(400, "max_age must be between 1 and 1000 frames.")
+
+
+def validate_counting_settings(
+    count_line_position: float,
+    in_direction: str,
+) -> None:
+    if not 0.1 <= count_line_position <= 0.9:
+        raise HTTPException(
+            400, "Counting-line position must be between 0.1 and 0.9."
+        )
+    if in_direction not in {"top_to_bottom", "bottom_to_top"}:
+        raise HTTPException(
+            400, "in_direction must be top_to_bottom or bottom_to_top."
+        )
+
+
+@app.post("/api/track")
+async def track_video(
+    video: UploadFile = File(...),
+    confidence: float = 0.1,
+    max_age: int = 90,
+    camera_id: str = "camera_1",
+    count_line_position: float = 0.5,
+    in_direction: str = "top_to_bottom",
+) -> dict[str, Any]:
+    input_path: Path | None = None
+    output_path: Path | None = None
+    try:
+        validate_tracking_settings(confidence, max_age)
+        validate_counting_settings(count_line_position, in_direction)
+        camera_id = validate_camera_id(camera_id)
+        allowed_extensions = {".mp4", ".avi", ".mov", ".mkv"}
+        suffix = Path(video.filename or "").suffix.lower()
+        if suffix not in allowed_extensions:
+            raise HTTPException(400, "Upload an MP4, AVI, MOV, or MKV video.")
+
+        job_id = uuid.uuid4().hex
+        input_path = UPLOADS / f"{job_id}{suffix}"
+        output_path = OUTPUTS / f"{job_id}_tracked.mp4"
+        tracking_analytics = TrackingAnalytics(
+            count_line_position=count_line_position,
+            in_direction=in_direction,
+        )
+        with input_path.open("wb") as uploaded_file:
+            shutil.copyfileobj(video.file, uploaded_file)
+        result = await run_in_threadpool(
+            run_tracking,
+            input_path,
+            output_path,
+            confidence,
+            max_age,
+            camera_id,
+            tracking_analytics,
+        )
+        result["job_id"] = job_id
+        return result
+    except HTTPException:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Tracking failed: {exc}") from exc
+    finally:
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
+        await video.close()
+
+
+@app.post("/api/track/multi-camera")
+async def track_multiple_cameras(
+    videos: list[UploadFile] = File(...),
+    camera_ids: list[str] = Form(...),
+    start_times: list[float] | None = Form(None),
+    count_line_position: float = Form(0.5),
+    in_direction: str = Form("top_to_bottom"),
+    confidence: float = 0.1,
+    max_age: int = 90,
+) -> dict[str, Any]:
+    input_paths: list[Path] = []
+    output_paths: list[Path] = []
+    try:
+        validate_tracking_settings(confidence, max_age)
+        validate_counting_settings(count_line_position, in_direction)
+        if not 2 <= len(videos) <= 8:
+            raise HTTPException(400, "Upload between 2 and 8 camera videos.")
+        if len(camera_ids) != len(videos):
+            raise HTTPException(400, "Provide one camera ID for each video.")
+
+        normalized_camera_ids = [validate_camera_id(value) for value in camera_ids]
+        if len({value.casefold() for value in normalized_camera_ids}) != len(videos):
+            raise HTTPException(400, "Each uploaded clip must have a unique camera ID.")
+        if start_times is not None and len(start_times) != len(videos):
+            raise HTTPException(400, "Provide one start-time offset for each video.")
+        normalized_start_times = (
+            start_times if start_times is not None else [0.0] * len(videos)
+        )
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in normalized_start_times
+        ):
+            raise HTTPException(
+                400, "Start-time offsets must be finite, non-negative seconds."
+            )
+
+        allowed_extensions = {".mp4", ".avi", ".mov", ".mkv"}
+        suffixes = [Path(video.filename or "").suffix.lower() for video in videos]
+        if any(suffix not in allowed_extensions for suffix in suffixes):
+            raise HTTPException(400, "Use MP4, AVI, MOV, or MKV camera videos.")
+
+        job_id = uuid.uuid4().hex
+        tracking_analytics = TrackingAnalytics(
+            count_line_position=count_line_position,
+            in_direction=in_direction,
+        )
+        camera_results: list[dict[str, Any]] = []
+        total_detections = 0
+
+        for index, (video, suffix, camera_id, start_time) in enumerate(
+            zip(
+                videos,
+                suffixes,
+                normalized_camera_ids,
+                normalized_start_times,
+                strict=True,
+            )
+        ):
+            input_path = UPLOADS / f"{job_id}_{index}{suffix}"
+            output_path = OUTPUTS / f"{job_id}_{index}_tracked.mp4"
+            input_paths.append(input_path)
+            output_paths.append(output_path)
+            with input_path.open("wb") as uploaded_file:
+                shutil.copyfileobj(video.file, uploaded_file)
+
+            camera_result = await run_in_threadpool(
+                run_tracking,
+                input_path,
+                output_path,
+                confidence,
+                max_age,
+                camera_id,
+                tracking_analytics,
+                start_time,
+            )
+            camera_results.append(camera_result)
+            total_detections += camera_result["total_detections"]
+
+        return {
+            "job_id": job_id,
+            "camera_count": len(camera_results),
+            "camera_results": camera_results,
+            "total_detections": total_detections,
+            "total_global_ids": len(tracking_analytics.global_tracks),
+            "object_counts": tracking_analytics.get_global_counts(),
+            "flow_counts": tracking_analytics.get_all_flow_counts(),
+            "cross_camera_matches": tracking_analytics.cross_camera_matches,
+            "cross_camera_matching": (
+                "Appearance-based HSV matching; verify links because camera views "
+                "and lighting can change appearance."
+            ),
+        }
+    except HTTPException:
+        for output_path in output_paths:
+            output_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        for output_path in output_paths:
+            output_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Multi-camera tracking failed: {exc}") from exc
+    finally:
+        for input_path in input_paths:
+            input_path.unlink(missing_ok=True)
+        for video in videos:
+            await video.close()
 
 def run_tracking(
     input_path: Path,
     output_path: Path,
-    conf: float = 0.1,
-    max_age: int = 90,
+    conf: float,
+    max_age: int,
+    camera_id: str = "camera_1",
+    tracking_analytics: TrackingAnalytics | None = None,
+    start_time_seconds: float = 0.0,
 ) -> dict[str, Any]:
+    if tracking_analytics is None:
+        tracking_analytics = TrackingAnalytics()
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         raise ValueError("Could not open the uploaded video.")
@@ -348,7 +568,6 @@ def run_tracking(
     if width <= 0 or height <= 0:
         cap.release()
         raise ValueError("Video has invalid dimensions.")
-
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter.fourcc(*"mp4v"),
@@ -363,6 +582,7 @@ def run_tracking(
     tracker = IdentityTracker(max_age=max_age)
     estimated_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     timeline_interval = max(1, estimated_frames // 500)
+    history_interval = max(1, estimated_frames // 300)
     frame_no = 0
     total_detections = 0
     timeline: list[dict[str, Any]] = []
@@ -378,9 +598,48 @@ def run_tracking(
             frame = cast(ImageArray, frame)
             detections = detect_objects(frame, conf)
             visible = tracker.update(detections, frame_no)
+
+            line_y = round(
+                height * tracking_analytics.count_line_position
+            )
+            cv2.line(frame, (0, line_y), (width - 1, line_y), (35, 45, 220), 2)
+            in_label = (
+                "IN: DOWN | OUT: UP"
+                if tracking_analytics.in_direction == "top_to_bottom"
+                else "IN: UP | OUT: DOWN"
+            )
+            cv2.putText(
+                frame,
+                in_label,
+                (12, max(18, line_y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
             total_detections += len(visible)
 
             for obj in visible:
+                track = tracker.tracks[obj["id"]]
+                global_id, match_similarity = tracking_analytics.record_track(
+                    camera_id,
+                    obj["id"],
+                    obj["class_name"],
+                    obj["box"],
+                    track.feature,
+                    frame_no,
+                    float(fps),
+                    height,
+                    record_history=(
+                        frame_no == 1 or frame_no % history_interval == 0
+                    ),
+                    time_offset_seconds=start_time_seconds,
+                )
+                obj["global_id"] = global_id
+                obj["camera_id"] = camera_id
+                obj["cross_camera_similarity"] = match_similarity
+
                 x1, y1, x2, y2 = map(int, obj["box"])
                 pad_x = max(3, min(10, round((x2 - x1) * 0.04)))
                 pad_y = max(3, min(10, round((y2 - y1) * 0.04)))
@@ -388,14 +647,15 @@ def run_tracking(
                 box_x2 = min(width - 1, x2 + pad_x)
                 box_y2 = min(height - 1, y2 + pad_y)
                 color = tuple(
-                    32 + (obj["id"] * factor) % 72 for factor in (67, 131, 197)
+                    32 + (global_id * factor) % 72
+                    for factor in (67, 131, 197)
                 )
                 thickness = max(3, min(5, round(min(width, height) / 500)))
                 cv2.rectangle(
                     frame, (box_x1, box_y1), (box_x2, box_y2), color, thickness
                 )
                 label = (
-                    f'ID {obj["id"]} | {obj["class_name"]} '
+                    f'G{global_id} | {obj["class_name"]} '
                     f'| {obj["confidence"]:.2f}'
                 )
                 label_top = max(0, box_y1 - 24)
@@ -419,10 +679,13 @@ def run_tracking(
                     str(obj["id"]),
                     {
                         "id": obj["id"],
+                        "camera_id": camera_id,
                         "class_name": obj["class_name"],
                         "first_seen": frame_no,
                         "last_seen": frame_no,
                         "observations": 0,
+                        "global_id": global_id,
+                        "cross_camera_similarity": match_similarity,
                     },
                 )
                 identity["last_seen"] = frame_no
@@ -438,51 +701,38 @@ def run_tracking(
     if frame_no == 0:
         raise ValueError("The uploaded file contains no readable frames.")
 
+    for identity in identity_summary.values():
+        identity["movement_history"] = tracking_analytics.get_trajectory(
+            camera_id, identity["id"]
+        )
+
+    global_ids = {
+        tracking_analytics.local_to_global[(camera_id, identity["id"])]
+        for identity in identity_summary.values()
+    }
+
     return {
         "video_url": f"/outputs/{output_path.name}",
+        "camera_id": camera_id,
+        "start_time_seconds": start_time_seconds,
         "frames": frame_no,
         "fps": round(float(fps), 2),
         "total_ids": len(identity_summary),
+        "total_global_ids": len(global_ids),
         "total_detections": total_detections,
+        "object_counts": tracking_analytics.get_camera_counts(camera_id),
+        "flow_counts": tracking_analytics.get_camera_flow_counts(camera_id),
+        "flow_events": tracking_analytics.get_camera_flow_events(camera_id),
+        "movement_alerts": tracking_analytics.get_camera_movement_alerts(camera_id),
+        "counting_line": {
+            "position": tracking_analytics.count_line_position,
+            "in_direction": tracking_analytics.in_direction,
+            "out_direction": (
+                "bottom_to_top"
+                if tracking_analytics.in_direction == "top_to_bottom"
+                else "top_to_bottom"
+            ),
+        },
         "identity_summary": list(identity_summary.values()),
         "timeline": timeline,
     }
-
-
-@app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "model": MODEL_NAME}
-
-
-@app.post("/api/track")
-async def track_video(
-    video: UploadFile = File(...),
-    confidence: float = 0.1,
-    max_age: int = 90,
-) -> dict[str, Any]:
-    allowed_extensions = {".mp4", ".avi", ".mov", ".mkv"}
-    suffix = Path(video.filename or "").suffix.lower()
-    if suffix not in allowed_extensions:
-        raise HTTPException(400, "Upload an MP4, AVI, MOV, or MKV video.")
-    if not 0.05 <= confidence <= 0.95:
-        raise HTTPException(400, "Confidence must be between 0.05 and 0.95.")
-    if not 1 <= max_age <= 1000:
-        raise HTTPException(400, "max_age must be between 1 and 1000 frames.")
-
-    job_id = uuid.uuid4().hex
-    input_path = UPLOADS / f"{job_id}{suffix}"
-    output_path = OUTPUTS / f"{job_id}_tracked.mp4"
-    try:
-        with input_path.open("wb") as uploaded_file:
-            shutil.copyfileobj(video.file, uploaded_file)
-        result = await run_in_threadpool(
-            run_tracking, input_path, output_path, confidence, max_age
-        )
-        result["job_id"] = job_id
-        return result
-    except Exception as exc:
-        output_path.unlink(missing_ok=True)
-        raise HTTPException(500, f"Tracking failed: {exc}") from exc
-    finally:
-        input_path.unlink(missing_ok=True)
-        await video.close()
